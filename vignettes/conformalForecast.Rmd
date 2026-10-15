@@ -16,7 +16,9 @@ knitr::opts_chunk$set(
 )
 ```
 
-The *conformalForecast* package provides some commonly used conformal prediction methods for time series forecasting.
+The *conformalForecast* package implements conformal prediction methods for **multistep-ahead** time series forecasting. Given a point forecasting model and a validation set of past forecast errors, these methods construct prediction intervals that are distribution-free: they do not rely on an assumed error distribution (such as Gaussian errors), and instead calibrate directly from the empirical behaviour of past errors.
+
+The package provides four conformal methods: split conformal prediction (`scp()`), adaptive conformal prediction (`acp()`), conformal PID control (`pid()`) and autocorrelated multistep-ahead conformal prediction (`acmcp()`). A unified `conformal()` function can call any of them by name. This vignette works through all four, starting from the simplest (SCP) and ending with AcMCP, the main contribution of the accompanying paper.
 
 ```{r setup}
 library(conformalForecast)
@@ -29,22 +31,27 @@ library(tsibble)
 
 ## Data simulation
 
-Suppose we are interested in forecasting a time series data generated from an AR(2) model with $\phi_1 = 0.8$, $\phi_2=-0.5$, and $\sigma^2 = 1$.
+Suppose we want to forecast a time series generated from an AR(2) model with $\phi_1 = 0.8$, $\phi_2 = -0.5$, and $\sigma^2 = 1$.
+
+We simulate 1005 observations and hold the last five back: the first 1000 are used throughout the vignette, and the remaining five are used later to demonstrate updating a fitted conformal object with newly arrived data.
 
 ```{r data, fig.width = 7, fig.height = 3}
 set.seed(0)
-series <- arima.sim(n = 1000, list(ar = c(0.8, -0.5)), sd = sqrt(1))
+series_all <- arima.sim(n = 1005, list(ar = c(0.8, -0.5)), sd = sqrt(1))
+series <- head(series_all, 1000)
+new_data <- as.numeric(tail(series_all, 5))
 autoplot(series) +
   labs(
-    title = "Time series generated from an AR(2) model",
-    ylab = ""
+    title = "Time series generated from an AR(2) model"
   ) +
   theme_bw()
 ```
 
 ## Time series cross-validation
 
-We first train a forecasting model AR(2) on a rolling forecast origin to generate forecasts and forecast errors on validation sets.
+Before we can calibrate any conformal method, we need a record of past forecast errors to calibrate against. We obtain this with `cvforecast()`, which repeatedly fits the AR(2) model on a rolling forecast origin and produces out-of-sample point forecasts and errors at every origin, for every forecast horizon up to `h`.
+
+Two arguments control how the origins are laid out. `forward = TRUE` appends an extra $h$-step forecast made from the final observation, so that the object carries genuinely future forecasts as well as the validation history. `window` sets how many recent observations each refit sees: a number gives a fixed-length rolling estimation window, while `window = NULL` lets the estimation window expand over time. A non-`NULL` `level` is required, since the conformal methods calibrate against the nominal levels stored in the object.
 
 ```{r cv}
 far2 <- function(x, h, level) {
@@ -59,8 +66,7 @@ summary(fc)
 fc |>
   autoplot() +
   labs(
-    title = "Forecasts produced using an AR(2) model",
-    ylab = ""
+    title = "Forecasts produced using an AR(2) model"
   ) +
   theme_bw()
 ```
@@ -71,13 +77,49 @@ fc |>
 (fc_wid <- width(fc, window = 100, level = 95, includemedian = TRUE))
 ```
 
+The object `fc` stores point forecasts `MEAN` and forecast errors `ERROR` as multivariate time series, in which column $h$ holds the values for forecast horizon $h$. In package notation, the error made forecasting $y_{t+h}$ from origin $t$ is
+$$e_{t+h|t} = y_{t+h} - \hat{y}_{t+h|t}.$$
+Every conformal method below calibrates against this `ERROR` matrix, one column (one horizon) at a time.
+
 ## Conformal prediction
 
-Based on the forecast errors on validation sets, we can train various conformal prediction methods to obtain distribution-free uncertainty estimation.
+The four methods differ in how the quantile used to build the intervals is obtained, from a plain empirical quantile of past scores in SCP to an online recursion in the later methods. They are presented below in that order.
+
+### The `conformal()` function
+
+All four methods share the same calling convention: they accept a `cvforecast` object, or a previous conformal fit when updating, and return prediction intervals for one or more nominal levels. The `conformal()` function provides a unified interface to these methods, which can be selected through its `method` argument:
+
+```{r conformal-taxonomy, echo = FALSE}
+data.frame(
+  method = c('"scp"', '"acp"', '"pid"', '"acmcp"'),
+  calls = c("`scp()`", "`acp()`", "`pid()`", "`acmcp()`"),
+  idea = c(
+    "Empirical quantile of past nonconformity scores, on an expanding or rolling calibration window",
+    "Online update of the miscoverage target alpha in response to whether the last interval covered",
+    "P (quantile tracking) + I (error integration) + D (scorecasting) applied per horizon",
+    "Same P+I+D structure as PID, but the scorecaster exploits correlation across horizons"
+  )
+) |>
+  knitr::kable(col.names = c("`method`", "function", "core idea"))
+```
+
+`conformal(fc, method = "scp", ...)` is exactly equivalent to `scp(fc, ...)`: `conformal()` forwards `object` and `...` to the chosen function and returns its result unchanged. The rest of this vignette calls `scp()`, `acp()`, `pid()` and `acmcp()` directly, to keep the method-specific arguments explicit.
+
+A few arguments recur across the methods and mean much the same thing everywhere. `ncal` is the length of the calibration history: for SCP and ACP it is the number of past scores the quantile is computed from, while for PID and AcMCP, which track the quantile recursively, it acts as a burn-in length before the recursion starts producing intervals. `rolling = TRUE` restricts that history to the most recent `ncal` errors wherever a window is used; `rolling = FALSE` (the default) lets it expand over time. `symmetric` chooses between calibrating absolute errors (`TRUE`) and calibrating the lower and upper tails separately (`FALSE`); AcMCP supports only the asymmetric case and therefore has no `symmetric` argument.
+
+Every method returns an object whose class vector is the method name followed by `cpforecast`, `cvforecast` and `forecast`, so `cpforecast` methods such as `accuracy()`, `coverage()` and `width()` apply to all four. Once you have one, you can extend it with newly observed data without recomputing the whole history, using `update()`; see `vignette("update", package = "conformalForecast")` for details.
 
 ### Classical split conformal prediction (SCP)
 
-Here, we perform a SCP method with equal weights in sample quantile estimation.
+SCP is the simplest of the four methods and a natural baseline. For each horizon $h$, it forms a vector of nonconformity scores $s_{t+h|t}$ from past errors, and predicts an interval by adding and subtracting an empirical quantile of those scores from the point forecast.
+
+If `symmetric = TRUE`, the score is the absolute error, $s_{t+h|t} = |e_{t+h|t}|$, and the $(1-\alpha)$-quantile $\hat{q}_{t+h|t}$ of the calibration scores gives a symmetric interval
+$$\left[\hat{y}_{t+h|t} - \hat{q}_{t+h|t},\ \hat{y}_{t+h|t} + \hat{q}_{t+h|t}\right].$$
+If `symmetric = FALSE` (the default we use below), upper and lower bounds are calibrated separately from signed scores, $s^u_{t+h|t} = e_{t+h|t}$ and $s^l_{t+h|t} = -e_{t+h|t}$, using the $(1-\alpha/2)$-quantiles $\hat{q}^u_{t+h|t}$ and $\hat{q}^l_{t+h|t}$ of the respective scores, giving
+$$\left[\hat{y}_{t+h|t} - \hat{q}^l_{t+h|t},\ \hat{y}_{t+h|t} + \hat{q}^u_{t+h|t}\right].$$
+Asymmetric scoring lets the interval be wider on one side than the other, which is useful whenever the error distribution itself is skewed.
+
+The calibration set the quantile is computed on can grow over time (`rolling = FALSE`): at time $t$ it is the expanding set $s_{1+h|1}, \dots, s_{t|t-h}$, using every score observed so far. Or it can be a fixed-length trailing window (`rolling = TRUE`): a window of `ncal` most recent scores. A rolling window adapts faster to a changing error distribution but uses less data per quantile estimate; an expanding window is more stable but slower to react if the error distribution drifts. Below we use a rolling window of `ncal = 100`.
 
 ```{r scp}
 scpfc <- scp(fc, symmetric = FALSE, ncal = 100, rolling = TRUE,
@@ -88,21 +130,32 @@ scpfc <- scp(fc, symmetric = FALSE, ncal = 100, rolling = TRUE,
 (scpfc_wid <- width(scpfc, window = 100, level = 95, includemedian = TRUE))
 ```
 
-The `scp()` function allows us to include non-equal weights for sample quantile estimation by passing a weight calculation function to the `weightfun` argument.
+`scp()` also allows non-equal weighting of the calibration scores via `weightfun`, a function that maps the number of scores in the calibration set to a vector of weights. This lets more recent scores count more toward the quantile than older ones, which is a middle ground between a rolling window (hard cutoff) and an expanding window (more stable but slower to adapt). The default `quantiletype = 1` retains the order-statistic estimator used by standard conformal calibration. When weights are used with a continuous quantile estimator (`quantiletype = 4:9`), setting `kess = TRUE` computes the quantile using Kish's effective sample size, $n_{\mathrm{eff}} = (\sum w)^2 / \sum w^2$, rather than the raw number of scores, so the quantile estimate reflects how much *effective* information the weighted sample actually carries.
 
 ```{r scp-exp}
 expweight <- function(n) 0.99^{n+1-(1:n)}
 scpfc_exp <- scp(fc, symmetric = FALSE, ncal = 100, rolling = TRUE,
-                 weightfun = expweight, kess = FALSE, quantiletype = 1)
+                 weightfun = expweight, kess = TRUE, quantiletype = 7)
 
 (scpfc_exp_score <- accuracy(scpfc_exp, byhorizon = TRUE))
 (scpfc_exp_cov <- coverage(scpfc_exp, window = 100, level = 95))
 (scpfc_exp_wid <- width(scpfc_exp, window = 100, level = 95, includemedian = TRUE))
 ```
 
+SCP is the right choice when you want a simple, well-understood baseline and the error distribution within the calibration window is reasonably stable; it does not adapt online to feedback about whether recent intervals actually covered, which is exactly what the later methods add.
+
 ### Adaptive conformal prediction (ACP)
 
-The ACP method uses an online update of $\alpha$ to perform the calibration so that we can achieve either approximate or exact marginal coverage.
+ACP (Gibbs and Candes 2021) keeps the SCP calibration mechanics but replaces the fixed miscoverage level $\alpha$ with one that adapts online. For symmetric intervals, a single level is updated according to
+$$\alpha_{t+h|t} := \alpha_{t+h-1|t-1} + \gamma\left(\alpha - \mathrm{err}_{t|t-h}\right),$$
+where $\mathrm{err}_{t|t-h} = 1$ indicates a miss and $0$ a hit. For asymmetric intervals, as used below, the lower and upper tails are updated separately:
+$$\begin{aligned}
+\alpha^l_{t+h|t} &:= \alpha^l_{t+h-1|t-1} + \gamma\left(\alpha/2 - \mathrm{err}^l_{t|t-h}\right),\\
+\alpha^u_{t+h|t} &:= \alpha^u_{t+h-1|t-1} + \gamma\left(\alpha/2 - \mathrm{err}^u_{t|t-h}\right),
+\end{aligned}$$
+where $\mathrm{err}^l$ and $\mathrm{err}^u$ indicate misses below and above the interval, respectively. The symmetric level is initialized at $\alpha$, while both tail-specific levels are initialized at $\alpha/2$. Each recursion is computed separately for every horizon $h$. A miss pushes the corresponding level down and widens that side of the next interval, while a hit pushes it up. At each step, the quantile is still computed from an expanding or rolling calibration window, as in SCP, but uses the current adaptive level.
+
+The step size $\gamma > 0$ (argument `gamma`) controls how fast $\alpha$ reacts: larger values adapt more quickly to a change in the underlying error distribution but make the interval width more volatile; smaller values are steadier but slower to correct a persistent miscoverage. This adaptivity is what lets ACP maintain close-to-nominal long-run coverage under distribution shift, where an SCP quantile computed from a stale calibration window would not.
 
 ```{r acp}
 acpfc <- acp(fc, symmetric = FALSE, gamma = 0.005, ncal = 100, rolling = TRUE)
@@ -114,7 +167,16 @@ acpfc <- acp(fc, symmetric = FALSE, gamma = 0.005, ncal = 100, rolling = TRUE)
 
 ### Conformal PID control (PID)
 
-The PID method combines three modules (quantile tracking, error integration, and scorecasting) to make an iteration to produce a sequence of quantile estimates used in the prediction sets.
+PID (Angelopoulos, Candes, and Tibshirani 2023) generalizes ACP by tracking the quantile $q_{t+h|t}$ itself (rather than $\alpha$) through three additive components, evocative of a proportional-integral-derivative controller. For symmetric intervals, the recursion is
+$$q_{t+h|t}=\underbrace{q_{t+h-1|t-1} + \eta\left(\mathrm{err}_{t|t-h}-\alpha\right)}_{\text{P}} + \underbrace{r_t\!\left(\sum_{i=1}^t\left(\mathrm{err}_{i|i-h}-\alpha\right)\right)}_{\text{I}} + \underbrace{\hat{s}_{t+h|t}}_{\text{D}},$$
+computed separately for each horizon $h$. For asymmetric intervals, as used in both examples below, the lower and upper quantiles follow separate recursions. For $b \in \{l,u\}$,
+$$q^b_{t+h|t}=q^b_{t+h-1|t-1} + \eta\left(\mathrm{err}^b_{t|t-h}-\alpha/2\right) + r_t\!\left(\sum_{i=1}^t\left(\mathrm{err}^b_{i|i-h}-\alpha/2\right)\right) + \hat{s}^b_{t+h|t}.$$
+
+- The P term, quantile tracking, applies the same idea as ACP's $\alpha$ update directly to the quantile, with each quantile initialized at $0$. Its target is $\alpha$ for symmetric intervals and $\alpha/2$ for each tail of an asymmetric interval. The step size $\eta$ (argument `lr`) is scaled internally by the recent range of the errors, so it adapts to the level of forecast uncertainty rather than being a fixed number of score units.
+- The I term, error integration, corrects a persistent bias in realized coverage, which the memoryless P term reacts to only slowly. It feeds the corresponding cumulative miscoverage through a nonlinear saturation function
+$$r_t(x) = K_{\mathrm{I}} \tan\!\left(\frac{x \log(t)}{t\, C_{\mathrm{sat}}}\right),$$
+where $\tan(x) = \mathrm{sign}(x)\cdot\infty$ once $x \notin [-\pi/2, \pi/2]$. $C_{\mathrm{sat}}$ and $K_{\mathrm{I}}$ are positive constants chosen heuristically: $K_{\mathrm{I}}$ (argument `KI`) puts the integrator on the same scale as the scores, and $C_{\mathrm{sat}}$ (argument `Csat`) is chosen so that, by a target time `Tg`, the method achieves at least $1-\alpha-\delta$ absolute coverage for a chosen tolerance `delta`. You can either supply `Csat` directly, as we do below, or leave it at its default of `NULL` and let it be derived from `Tg` and `delta`; in the latter case `Tg` must be greater than 1 and `delta` must lie in $(0, 1)$. Setting `integrate = FALSE` drops this term entirely.
+- The D term, scorecasting, adds a forecast of the nonconformity score itself, $\hat{s}_{t+h|t}$, produced by fitting a user-supplied `scorecastfun` to the scores observed so far. This anticipates predictable structure in the scores (a trend, a seasonal pattern) instead of only reacting to it after the fact. Set `scorecast = FALSE` to omit this term, or supply, e.g., a naive forecaster as below.
 
 ```{r pid-setup}
 # PID setup
@@ -128,7 +190,7 @@ lr <- 0.1
 # PID without scorecaster
 pidfc_nsf <- pid(fc, symmetric = FALSE, ncal = 100, rolling = TRUE,
                  integrate = TRUE, scorecast = FALSE,
-                 lr = lr, KI = KI, Csat = Csat)
+                 lr = lr, Tg = Tg, KI = KI, Csat = Csat)
 
 (pidfc_nsf_score <- accuracy(pidfc_nsf, byhorizon = TRUE))
 (pidfc_nsf_cov <- coverage(pidfc_nsf, window = 100, level = 95))
@@ -142,29 +204,99 @@ naivefun <- function(x, h) {
 }
 pidfc <- pid(fc, symmetric = FALSE, ncal = 100, rolling = TRUE,
              integrate = TRUE, scorecast = TRUE, scorecastfun = naivefun,
-             lr = lr, KI = KI, Csat = Csat)
+             lr = lr, Tg = Tg, KI = KI, Csat = Csat)
 
 (pidfc_score <- accuracy(pidfc, byhorizon = TRUE))
 (pidfc_cov <- coverage(pidfc, window = 100, level = 95))
 (pidfc_wid <- width(pidfc, window = 100, level = 95, includemedian = TRUE))
 ```
 
-### Multistep-ahead conformal prediction (AcMCP)
+PID is a good choice when you want both the persistent-bias correction that ACP lacks (via I) and the ability to plug in domain knowledge about the score dynamics (via D, through the scorecaster). Its scorecaster is trained separately at each horizon $h$, using only that horizon's own score history, and therefore does not model dependence across horizons. AcMCP closes this gap without using future realized errors.
 
-Similar to the PID method, the AcMCP method also integrates three modules (P, I, and D) to form the final iteration. However, instead of performing conformal prediction for each individual forecast horizon $h$ separately, AcMCP employs a combination of an MA($h-1$) model and a linear regression model of $e_{t+h|t}$ on $e_{t+h-1|t},\dots,e_{t+1|t}$ as the scorecaster. This allows the AcMCP method to capture the relationship between the $h$-step ahead forecast error and past errors.
+### Autocorrelated multistep-ahead conformal prediction (AcMCP)
+
+AcMCP (Wang and Hyndman 2024) keeps PID's P+I+D structure, and supports only asymmetric (signed-error) scores, but replaces the scorecaster in the D term. The scorecaster averages two forecasts: an $\mathrm{MA}(h-1)$ model fitted to the historical horizon-$h$ errors, and a linear regression of historical horizon-$h$ errors on shorter-horizon errors aligned by forecast origin. At prediction origin $t$, the errors $e_{t+1|t}, \dots, e_{t+h-1|t}$ are not yet observed, so the regression uses their recursively generated scorecasts instead. At $h=1$, where there is no shorter-horizon input, the scorecaster falls back to a simple mean forecast.
+
+This exploits the correlation between horizons. Optimal $h$-step-ahead forecast errors are serially correlated up to lag $h-1$ under general nonstationary autoregressive data-generating processes. AcMCP estimates this dependence from historical errors available by the prediction origin and recursively constructs the shorter-horizon inputs needed to scorecast horizon $h$. The guarantee being targeted is asymptotic marginal coverage. Realized coverage will fluctuate around the nominal level in any finite validation set, more so at longer horizons.
+
+Two practical points follow from the way this scorecaster is built. The MA component is fitted by CSS-ML estimation by default, matching the reference implementation; `ma_method = "CSS"` is available and is faster at longer forecast horizons, at the cost of somewhat different estimates. And because the regression at horizon $h$ consumes the scorecasts made at horizons $1, \dots, h-1$, the scorecasts are constructed recursively: the first scorecast for horizon $h$ only becomes available at cross-validation error index $n_{\mathrm{cal}} + h(h-1)/2$.
 
 ```{r acmcp}
 acmcpfc <- acmcp(fc, ncal = 100, rolling = TRUE, integrate = TRUE, scorecast = TRUE,
-             lr = lr, KI = KI, Csat = Csat)
+                 lr = lr, Tg = Tg, KI = KI, Csat = Csat)
 
 (acmcpfc_score <- accuracy(acmcpfc, byhorizon = TRUE))
 (acmcpfc_cov <- coverage(acmcpfc, window = 100, level = 95))
 (acmcpfc_wid <- width(acmcpfc, window = 100, level = 95, includemedian = TRUE))
 ```
 
+## Updating with new observations
+
+When new observations become available, `update()` extends the cross-validation forecasts and the conformal intervals without recomputing the results that are already there. It replays the conformal settings stored in the fitted object, so the extension is made under exactly the same configuration as the original fit.
+
+```{r update}
+scpfc_updated <- update(scpfc, new_data = new_data, forecastfun = far2)
+length(scpfc_updated$x)
+scpfc_updated$mean
+```
+
+This is only a first look; `vignette("update", package = "conformalForecast")` covers updating in full, including which methods can resume from stored state and what has to match for them to do so.
+
+## Forecasting with external regressors
+
+If the forecasting model uses external regressors, `forecastfun` should accept `xreg` for the training period and `newxreg` for the forecast period. The following smaller example uses the first 300 observations of the simulated series and reserves the next five for updating.
+
+```{r xreg}
+far2_xreg <- function(x, h, level, xreg, newxreg) {
+  Arima(x, order = c(2, 0, 0), xreg = xreg) |>
+    forecast(h = h, level = level, xreg = newxreg)
+}
+
+n <- 300
+h <- 3
+n_update <- 5
+series_xreg <- head(series_all, n)
+new_data_xreg <- as.numeric(series_all[n + seq_len(n_update)])
+xreg_all <- cbind(
+  trend = seq_len(n + h + n_update),
+  cycle = sin(2 * pi * seq_len(n + h + n_update) / 12)
+)
+
+fc_xreg <- cvforecast(
+  series_xreg,
+  forecastfun = far2_xreg,
+  h = h,
+  level = 95,
+  forward = TRUE,
+  window = 100,
+  xreg = xreg_all[seq_len(n + h), ]
+)
+scpfc_xreg <- conformal(
+  fc_xreg,
+  method = "scp",
+  symmetric = FALSE,
+  ncal = 100,
+  rolling = TRUE
+)
+```
+
+This chunk also shows the unified interface in use: `conformal(fc_xreg, method = "scp", ...)` does exactly what a direct call to `scp()` would do.
+
+With `forward = TRUE`, the stored `xreg` already contains the original $h$ future rows. Therefore, `new_xreg` supplies the rows immediately after the stored predictor matrix, keeping the next forecast horizon available after the update. It must have one row per new observation and the same columns as the stored `xreg`.
+
+```{r xreg-update}
+scpfc_xreg_updated <- update(
+  scpfc_xreg,
+  new_data = new_data_xreg,
+  forecastfun = far2_xreg,
+  new_xreg = xreg_all[n + h + seq_len(n_update), ]
+)
+scpfc_xreg_updated$mean
+```
+
 ## Coverage and width of prediction intervals
 
-Taking the AcMCP result as an example, we now show the average coverage on validation sets.
+Taking the AcMCP result as an example, we now look at the rolling average coverage on the validation set.
 
 ```{r covplot, fig.width = 7, fig.height = 5}
 acmcpfc_cov$rollmean |>
@@ -181,7 +313,7 @@ acmcpfc_cov$rollmean |>
   theme_bw()
 ```
 
-We can also show the rolling average interval width on validation sets.
+We can similarly look at the rolling average interval width on the validation set.
 
 ```{r widplot, fig.width = 7, fig.height = 5}
 acmcpfc_wid$rollmean |>
@@ -197,7 +329,9 @@ acmcpfc_wid$rollmean |>
   theme_bw()
 ```
 
-We can also combine all the results and show them in one single plot.
+Finally, we combine the results from all the methods considered above into a single comparison: the underlying AR(2) model's own intervals (`AR`), SCP with equal weights (`SCP`), weighted conformal prediction with exponential weights (`WCP`), ACP, proportional-integral control without scorecasting (`PI`), PID with a naive scorecaster (`PID`), and AcMCP.
+
+The comparison is based on a single simulated series and is intended only to illustrate the output; it should not be used to rank the methods.
 
 ```{r bind-cov, fig.width = 7, fig.height = 5}
 candidates <- c("fc", "scpfc", "scpfc_exp", "acpfc", "pidfc_nsf", "pidfc", "acmcpfc")
@@ -228,7 +362,7 @@ cov |>
   as_tsibble(index = index, key = c(horizon, method)) |>
   mutate(method = factor(method, levels = methods)) |>
   ggplot(aes(x = index, y = coverage, group = method, colour = method)) +
-  geom_line(size = 0.8, alpha = 0.8) +
+  geom_line(linewidth = 0.8, alpha = 0.8) +
   scale_colour_manual(values = cols) +
   geom_hline(yintercept = 0.95, linetype = "dashed", colour = "gray") +
   facet_grid(horizon~.) +
@@ -277,7 +411,7 @@ wid |>
   as_tsibble(index = index, key = c(horizon, method)) |>
   mutate(method = factor(method, levels = methods)) |>
   ggplot(aes(x = index, y = width, group = method, colour = method)) +
-  geom_line(size = 0.8, alpha = 0.8) +
+  geom_line(linewidth = 0.8, alpha = 0.8) +
   scale_colour_manual(values = cols) +
   facet_grid(horizon~.) +
   xlab("Time") +
@@ -285,3 +419,10 @@ wid |>
   theme_bw()
 ```
 
+## References
+
+Angelopoulos, A., Candes, E., and Tibshirani, R. J. (2023). "Conformal PID control for time series prediction". *Advances in Neural Information Processing Systems*, 36, 23047–23074.
+
+Gibbs, I., and Candes, E. (2021). "Adaptive conformal inference under distribution shift". *Advances in Neural Information Processing Systems*, 34, 1660–1672.
+
+Wang, X., and Hyndman, R. J. (2024). "Online conformal inference for multi-step time series forecasting". arXiv:2410.13115. <https://doi.org/10.48550/arXiv.2410.13115>
