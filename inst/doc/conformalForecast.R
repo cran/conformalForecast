@@ -46,6 +46,16 @@ fc |>
 (fc_cov <- coverage(fc, window = 100, level = 95))
 (fc_wid <- width(fc, window = 100, level = 95, includemedian = TRUE))
 
+## ----point-only---------------------------------------------------------------
+point_fun <- function(x, h, level) {
+  list(mean = rep(tail(x, 1), h))
+}
+fc_point <- cvforecast(series, forecastfun = point_fun, h = 3,
+                       level = NULL, window = 100)
+cp_point <- scp(fc_point, alpha = 0.1, ncal = 100, rolling = TRUE)
+accuracy(fc_point, measures = point_measures, byhorizon = TRUE)
+coverage(cp_point, level = 90)
+
 ## ----conformal-taxonomy, echo = FALSE-----------------------------------------
 data.frame(
   method = c('"scp"', '"acp"', '"pid"', '"acmcp"'),

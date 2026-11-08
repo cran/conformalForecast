@@ -457,11 +457,11 @@ is given and replays the settings recorded in it.</p>
 <span id="cb5-12"><a href="#cb5-12" tabindex="-1"></a>}</span>
 <span id="cb5-13"><a href="#cb5-13" tabindex="-1"></a><span class="fu">round</span>(timings_update, <span class="dv">3</span>)</span>
 <span id="cb5-14"><a href="#cb5-14" tabindex="-1"></a><span class="co">#&gt;           scp   acp   pid acmcp</span></span>
-<span id="cb5-15"><a href="#cb5-15" tabindex="-1"></a><span class="co">#&gt; batch 1 0.044 0.044 0.064 0.145</span></span>
-<span id="cb5-16"><a href="#cb5-16" tabindex="-1"></a><span class="co">#&gt; batch 2 0.043 0.043 0.062 0.154</span></span>
-<span id="cb5-17"><a href="#cb5-17" tabindex="-1"></a><span class="co">#&gt; batch 3 0.043 0.043 0.062 0.148</span></span>
-<span id="cb5-18"><a href="#cb5-18" tabindex="-1"></a><span class="co">#&gt; batch 4 0.045 0.045 0.064 0.145</span></span>
-<span id="cb5-19"><a href="#cb5-19" tabindex="-1"></a><span class="co">#&gt; batch 5 0.045 0.045 0.065 0.147</span></span></code></pre></div>
+<span id="cb5-15"><a href="#cb5-15" tabindex="-1"></a><span class="co">#&gt; batch 1 0.041 0.041 0.058 0.137</span></span>
+<span id="cb5-16"><a href="#cb5-16" tabindex="-1"></a><span class="co">#&gt; batch 2 0.041 0.040 0.058 0.144</span></span>
+<span id="cb5-17"><a href="#cb5-17" tabindex="-1"></a><span class="co">#&gt; batch 3 0.041 0.042 0.058 0.142</span></span>
+<span id="cb5-18"><a href="#cb5-18" tabindex="-1"></a><span class="co">#&gt; batch 4 0.040 0.042 0.057 0.140</span></span>
+<span id="cb5-19"><a href="#cb5-19" tabindex="-1"></a><span class="co">#&gt; batch 5 0.042 0.043 0.057 0.141</span></span></code></pre></div>
 <p>That is the whole streaming loop: five calls to <code>update()</code>
 per method, each doing only the work required by the 20 new observations
 in that batch.</p>
@@ -505,11 +505,11 @@ this approach.</p>
 <span id="cb6-28"><a href="#cb6-28" tabindex="-1"></a>}</span>
 <span id="cb6-29"><a href="#cb6-29" tabindex="-1"></a><span class="fu">round</span>(timings_full, <span class="dv">3</span>)</span>
 <span id="cb6-30"><a href="#cb6-30" tabindex="-1"></a><span class="co">#&gt;         cvforecast   scp   acp   pid acmcp</span></span>
-<span id="cb6-31"><a href="#cb6-31" tabindex="-1"></a><span class="co">#&gt; batch 1      0.310 0.057 0.058 0.180 0.764</span></span>
-<span id="cb6-32"><a href="#cb6-32" tabindex="-1"></a><span class="co">#&gt; batch 2      0.337 0.065 0.067 0.206 0.891</span></span>
-<span id="cb6-33"><a href="#cb6-33" tabindex="-1"></a><span class="co">#&gt; batch 3      0.375 0.073 0.078 0.228 0.995</span></span>
-<span id="cb6-34"><a href="#cb6-34" tabindex="-1"></a><span class="co">#&gt; batch 4      0.413 0.079 0.086 0.257 1.169</span></span>
-<span id="cb6-35"><a href="#cb6-35" tabindex="-1"></a><span class="co">#&gt; batch 5      0.450 0.090 0.095 0.286 1.220</span></span></code></pre></div>
+<span id="cb6-31"><a href="#cb6-31" tabindex="-1"></a><span class="co">#&gt; batch 1      0.292 0.053 0.055 0.172 0.725</span></span>
+<span id="cb6-32"><a href="#cb6-32" tabindex="-1"></a><span class="co">#&gt; batch 2      0.322 0.060 0.064 0.197 0.899</span></span>
+<span id="cb6-33"><a href="#cb6-33" tabindex="-1"></a><span class="co">#&gt; batch 3      0.359 0.066 0.074 0.217 0.942</span></span>
+<span id="cb6-34"><a href="#cb6-34" tabindex="-1"></a><span class="co">#&gt; batch 4      0.393 0.075 0.081 0.246 1.051</span></span>
+<span id="cb6-35"><a href="#cb6-35" tabindex="-1"></a><span class="co">#&gt; batch 5      0.425 0.084 0.090 0.270 1.162</span></span></code></pre></div>
 <p>The cost of the <code>cvforecast()</code> step grows with every
 batch. At <code>batch = 5</code> it fits the AR(2) model at essentially
 every rolling origin of a 300-point series, most of which were already
@@ -519,12 +519,16 @@ touches the observations that have just arrived.</p>
 </div>
 <div id="what-update-expects" class="section level2">
 <h2>What <code>update()</code> expects</h2>
-<p>Three points are worth keeping in mind when calling
+<p>Keep the following points in mind when calling
 <code>update()</code>.</p>
 <p><code>forecastfun</code> has to be supplied again at every call. It
 is not stored on the object, and it should be the same function used to
 build the original <code>cvforecast()</code> object, since it is used to
 fit the model at the newly added origins.</p>
+<p><code>update()</code> also preserves the original base forecast
+<code>level</code>, including <code>NULL</code>. For a point-only base
+model, supply <code>alpha</code> explicitly when first calibrating the
+object; subsequent updates retain that calibration level.</p>
 <p>The object being updated has to come from one of the conformal
 methods in the package. <code>update()</code> reads the settings
 recorded when the object was built, and reports an error if they are not
@@ -572,13 +576,13 @@ preserve the future <code>h = 2</code> forecast horizon.</p>
 </div>
 <div id="the-forward-forecast" class="section level2">
 <h2>The <code>forward</code> forecast</h2>
-<p>When the original <code>cvforecast()</code> object was built with
-<code>forward = TRUE</code>, which is the default, it carries
-<code>mean</code>, <code>lower</code> and <code>upper</code> components
-holding the out-of-sample forecast from the most recent origin. After
-the new data have been appended, <code>update()</code> refits the model
-at the new final origin, so that these components describe a forecast
-made from all the data now available.</p>
+<p>When the conformal fit was built with <code>forward = TRUE</code>,
+which is the default, it carries <code>mean</code>, <code>lower</code>
+and <code>upper</code> components holding the out-of-sample forecast
+from the most recent origin. After the new data have been appended,
+<code>update()</code> refits the model at the new final origin, so that
+these components describe a forecast made from all the data now
+available.</p>
 <div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a>scp_initial<span class="sc">$</span>mean</span>
 <span id="cb9-2"><a href="#cb9-2" tabindex="-1"></a><span class="co">#&gt; Time Series:</span></span>
 <span id="cb9-3"><a href="#cb9-3" tabindex="-1"></a><span class="co">#&gt; Start = 201 </span></span>
